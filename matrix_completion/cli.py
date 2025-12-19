@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import time
+import cupy as cp
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -12,13 +12,7 @@ import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 
-from tqdm import tqdm
-
 from matrix_completion.dataset import MatrixGenerator, Matrix
-from matrix_completion.utils.metrics import (
-    calculate_relative_error,
-    calculate_relative_residual,
-)
 from matrix_completion.logger import Logger
 
 from matrix_completion.algorithms.rcg_matrix_completion import RCGMatrixCompletion
@@ -33,94 +27,102 @@ class AlgoSpec:
     base_params: Dict
 
 
-def build_algos(num_iters: int, tol: float, alpha: float) -> List[AlgoSpec]:
+def build_algos(tol: float, alpha: float) -> List[AlgoSpec]:
     return [
         AlgoSpec(
             algo_id="RCG_QPRECON",
             ctor=RCGMatrixCompletion,
-            base_params={"num_iters": num_iters, "tol": tol, "alpha": alpha,
+            base_params={"num_iters": 3000, "tol": tol, "alpha": alpha,
                          "method": "rcg", "metric": "QPRECON"},
+        ),
+        AlgoSpec(
+            algo_id="RCG_QRIGHTINV",
+            ctor=RCGMatrixCompletion,
+            base_params={"num_iters": 3000, "tol": tol, "alpha": alpha,
+                         "method": "rcg", "metric": "QRIGHT-INV"},
         ),
         AlgoSpec(
             algo_id="RGD_QPRECON",
             ctor=RCGMatrixCompletion,
-            base_params={"num_iters": num_iters, "tol": tol, "alpha": alpha,
+            base_params={"num_iters": 3000, "tol": tol, "alpha": alpha,
                          "method": "rgd", "metric": "QPRECON"},
+        ),
+        AlgoSpec(
+            algo_id="RGD_QRIGHTINV",
+            ctor=RCGMatrixCompletion,
+            base_params={"num_iters": 3000, "tol": tol, "alpha": alpha,
+                         "method": "rgd", "metric": "QRIGHT-INV"},
         ),
         AlgoSpec(
             algo_id="LRGeomCG",
             ctor=LRGeomCG,
-            base_params={"num_iters": num_iters, "tol": tol, "singular_values_eps": 1e-6},
+            base_params={"num_iters": 500, "tol": tol, "singular_values_eps": 1e-6},
         ),
         AlgoSpec(
             algo_id="SimpleLS",
             ctor=SimpleLS,
-            base_params={"num_iters": num_iters, "tol": tol},
+            base_params={"num_iters": 500, "tol": tol, "lambda_reg": 0.0},
         ),
     ]
 
 
 def observed_matrix(mat: Matrix) -> np.ndarray:
+    # What algorithms should fit to (noisy observations if provided).
     if mat.M_noisy is not None:
         return mat.M_noisy
     return p_omega(mat.M_true, mat.mask)
 
 
-def run_one_algorithm(
-    spec: AlgoSpec,
-    matrix: Matrix,
-    rank: int,
-    meta: Dict | None = None,
-) -> Tuple[np.ndarray, pd.DataFrame, Dict]:
-    meta = meta or {}
+def algo_legend_label(algo_id: str, rank: int, alpha: float) -> str:
+    # MathText labels for legend (similar vibe as your example).
+    # Keep them short so legend doesn’t cover plots.
+    mapping = {
+        "RCG_QPRECON":   r"$\mathrm{RCG}\;(\mathrm{QPRECON})$",
+        "RCG_QRIGHTINV": r"$\mathrm{RCG}\;(\mathrm{QRIGHT\!-\!INV})$",
+        "RGD_QPRECON":   r"$\mathrm{RGD}\;(\mathrm{QPRECON})$",
+        "RGD_QRIGHTINV": r"$\mathrm{RGD}\;(\mathrm{QRIGHT\!-\!INV})$",
+        "LRGeomCG":      r"$\mathrm{LRGeomCG}$",
+        "SimpleLS":      r"$\mathrm{ALS/LS}$",
+    }
+    base = mapping.get(algo_id, algo_id)
+    # Put parameters as formulas too:
+    # - k is common in papers
+    # - alpha only relevant for RCG/RGD (but harmless to show always)
+    return f"{base} " + rf"$k={rank}$"
 
+
+def safe_for_log(y: pd.Series, eps: float = 1e-16) -> pd.Series:
+    # Avoid log(0); keep NaNs as NaNs
+    return y.where(y.isna(), y.clip(lower=eps))
+
+
+def run_one_algorithm(spec: AlgoSpec, matrix: Matrix, rank: int) -> Tuple[np.ndarray, pd.DataFrame]:
     params = dict(spec.base_params)
-    params["rank"] = rank
-    model = spec.ctor(params=params)
+    params["rank"] = int(rank)
 
-    # Logger owns timing + per-iter metrics
-    logger = Logger(meta=meta)
-    tqdm.write(f"  -> Running {spec.algo_id} (rank={rank})...")  # safe with tqdm [web:88]
+    model = spec.ctor(params=params)
+    logger = Logger()
+
+    click.echo(f"-> Running {spec.algo_id} (rank={rank})...")  # Click-friendly output. [web:81]
     X_hat = model.complete_matrix(matrix, logger=logger)
 
     df = pd.DataFrame(logger.records)
-
     if df.empty:
-        # Ensure at least one record exists
-        M_obs = observed_matrix(matrix)
+        # Hard fallback if algo didn’t log for some reason.
+        Y = observed_matrix(matrix)
         Omega = matrix.mask
         df = pd.DataFrame([{
             "iter": 0,
-            "time_s": float(logger.elapsed_s()),
-            "rel_error": float(calculate_relative_error(X_hat, matrix.M_true)),
-            "rel_residual": float(calculate_relative_residual(X_hat, M_obs, Omega)),
+            "time_s": float(getattr(logger, "elapsed_s", lambda: 0.0)()),
+            "cost": np.nan,
             "grad_norm": np.nan,
             "dir_norm": np.nan,
-            "cost": np.nan,
-            **meta,
+            "rel_error": float(np.linalg.norm(X_hat - matrix.M_true) / np.linalg.norm(matrix.M_true)),
+            "rel_residual": float(np.linalg.norm((Omega * (X_hat - Y))) / np.linalg.norm(Omega * Y)),
         }])
 
-    summary = {
-        "algo": spec.algo_id,
-        "rank": rank,
-        "iters": int(df["iter"].max()),
-        "time_s": float(df["time_s"].max()) if "time_s" in df.columns else np.nan,
-        "final_rel_error": float(df["rel_error"].dropna().iloc[-1]),
-        "final_rel_residual": float(df["rel_residual"].dropna().iloc[-1]),
-        "final_grad_norm": float(df["grad_norm"].dropna().iloc[-1]) if df["grad_norm"].notna().any() else np.nan,
-        "final_dir_norm": float(df["dir_norm"].dropna().iloc[-1]) if df["dir_norm"].notna().any() else np.nan,
-        **meta,
-    }
-
-    tqdm.write(
-        f"  <- Done {spec.algo_id}: "
-        f"time={summary['time_s']:.3f}s, "
-        f"final_rel_error={summary['final_rel_error']:.3e}, "
-        f"final_rel_residual={summary['final_rel_residual']:.3e}"
-    )
-
-    return X_hat, df, summary
-
+    df["algo"] = spec.algo_id
+    return X_hat, df
 
 def save_matrix_viz(mat: Matrix, X_hat: np.ndarray, out_dir: Path, prefix: str) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -132,7 +134,7 @@ def save_matrix_viz(mat: Matrix, X_hat: np.ndarray, out_dir: Path, prefix: str) 
     vmax = np.percentile(M_true, 99)
 
     for name, M in [("true", M_true), ("observed", M_obs), ("completed", X_hat)]:
-        if hasattr(M, 'get'): # came from cupy
+        if hasattr(M, 'get'):
             M = M.get()
         plt.figure(figsize=(6, 5))
         sns.heatmap(M, cmap="viridis", vmin=vmin, vmax=vmax)
@@ -141,251 +143,117 @@ def save_matrix_viz(mat: Matrix, X_hat: np.ndarray, out_dir: Path, prefix: str) 
         plt.savefig(out_dir / f"{prefix}_{name}.png", dpi=200)
         plt.close()
 
-
-def plot_curves(df_iters: pd.DataFrame, out_dir: Path, env_tag: str) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
+def plot_metrics_single_algo(df_algo: pd.DataFrame, out_path: Path, title: str, legend_label: str) -> None:
     sns.set_theme(style="darkgrid")
 
-    def _plot(metric: str, x: str, logy: bool = False):
-        plt.figure(figsize=(8, 5))
-        ax = sns.lineplot(data=df_iters, x=x, y=metric, hue="algo", style="algo", errorbar=None)
-        if logy:
-            ax.set_yscale("log")
-        plt.title(f"{env_tag}: {metric} vs {x}")
-        plt.tight_layout()
-        plt.savefig(out_dir / f"{env_tag}__{metric}_vs_{x}.png", dpi=200)
-        plt.close()
+    metrics = [
+        ("rel_error",     r"$\|X - A\|_F / \|A\|_F$",                         "Reconstruction Error Over Iterations"),
+        ("grad_norm",     r"$\|\nabla f\|_F$",                                 "Gradient Norm Over Iterations"),
+        ("rel_residual",  r"$\|P_{\Omega}(X - Y)\|_F / \|P_{\Omega}(Y)\|_F$",  "Reconstruction Residual Over Iterations"),
+        ("dir_norm",      r"$\|\eta\|_F$",                                     "Conjugate Direction Norm Over Iterations"),
+    ]
 
-    _plot("rel_error", "iter", logy=True)
-    _plot("grad_norm", "iter", logy=True)
-    _plot("rel_residual", "iter", logy=True)
-    _plot("dir_norm", "iter", logy=True)
+    df_algo = df_algo.sort_values("iter").copy()
+    fig, axes = plt.subplots(len(metrics), 1, figsize=(10, 12), sharex=True)
 
-    _plot("rel_error", "time_s", logy=True)
-    _plot("grad_norm", "time_s", logy=True)
-    _plot("rel_residual", "time_s", logy=True)
-    _plot("dir_norm", "time_s", logy=True)
+    x = df_algo["iter"].to_numpy()
+
+    for ax, (col, ylabel, subtitle) in zip(axes, metrics):
+        ax.set_title(subtitle)
+        ax.set_ylabel(ylabel)
+        ax.set_yscale("log")  # log scale y-axis [web:222]
+
+        if col not in df_algo.columns or not df_algo[col].notna().any():
+            # Keep subplot non-empty (LS: grad_norm/dir_norm), but make it explicit.
+            y_placeholder = np.full_like(x, 1.0, dtype=float)
+            sns.lineplot(ax=ax, x=x, y=y_placeholder, label=legend_label, errorbar=None)
+            ax.lines[-1].set_linestyle("--")
+            ax.lines[-1].set_alpha(0.35)
+
+            # Annotation instead of turning axis off. [web:242]
+            ax.text(
+                0.5, 0.5, f"{col}: N/A for this method",
+                transform=ax.transAxes,
+                ha="center", va="center",
+            )  # [web:242]
+
+            ax.set_ylim(1e-3, 1e3)  # stable log window for the placeholder
+            ax.legend(loc="upper right", frameon=True)
+            continue
+
+        y = df_algo[col].copy()
+        y = y.where(y.isna(), y.clip(lower=1e-16))  # avoid log(0)
+
+        sns.lineplot(ax=ax, x=df_algo["iter"], y=y, label=legend_label, errorbar=None)  # [web:15]
+        ax.legend(loc="upper right", frameon=True)
+
+    axes[-1].set_xlabel("Iteration")
+    fig.suptitle(title, y=0.995)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close(fig)
 
 
-def ensure_list(ctx, param, value):
-    if value is None:
-        return []
-    if len(value) == 1 and isinstance(value[0], str) and "," in value[0]:
-        return [float(x) if "." in x else int(x) for x in value[0].split(",")]
-    return list(value)
-
-
-@click.group()
-def mc():
-    """Matrix completion evaluation CLI."""
-    pass
-
-
-@mc.command()
+@click.command()
 @click.option("--m", type=int, default=900, show_default=True)
 @click.option("--n", type=int, default=900, show_default=True)
-@click.option("--ranks", multiple=True, callback=ensure_list, default=("10,50",), show_default=True)
-@click.option("--os", "OSs", multiple=True, callback=ensure_list, default=("0.3,0.7,0.9",), show_default=True)
+@click.option("--rank", type=int, default=10, show_default=True)
+@click.option("--os", "OS", type=float, default=0.9, show_default=True, help="Missing fraction (as in your generator).")
+
 @click.option("--noise-level", type=float, default=0.0, show_default=True)
 @click.option("--seed", type=int, default=42, show_default=True)
 
 @click.option("--alpha", type=float, default=0.33, show_default=True)
-@click.option("--num-iters", type=int, default=30_000, show_default=True)
+@click.option("--num-iters", type=int, default=1000, show_default=True)
 @click.option("--tol", type=float, default=1e-6, show_default=True)
 
 @click.option("--out", "out_dir", type=click.Path(path_type=Path), default=Path("out"), show_default=True)
-@click.option("--viz/--no-viz", default=True, show_default=True)
-def run(m, n, ranks, OSs, noise_level, seed, alpha, num_iters, tol, out_dir, viz):
-    click.secho("Starting run evaluation...", fg="green")  # Click supports styled output [web:81]
-    click.echo(f"Grid: ranks={list(ranks)} OSs={list(OSs)}")
-    click.echo(f"Matrix: m={m}, n={n}, noise_level={noise_level}, seed={seed}")
-    click.echo(f"Optimization: num_iters={num_iters}, tol={tol}, alpha={alpha}")
-    click.echo(f"Viz: {viz}")
-    click.echo(f"Output root: {out_dir}")
 
-    MG = MatrixGenerator()
-    algos = build_algos(num_iters=num_iters, tol=tol, alpha=alpha)
-
-    run_dir = out_dir / time.strftime("run_%Y%m%d_%H%M%S")
-    run_dir.mkdir(parents=True, exist_ok=True)
-    click.echo(f"Run directory: {run_dir}")
-
-    all_iters: List[pd.DataFrame] = []
-    all_summaries: List[Dict] = []
-
-    for rank in ranks:
-        for OS in OSs:
-            click.secho(f"\nGenerating matrix for rank={int(rank)} OS={float(OS)} ...", fg="cyan")
-
-            mat = MG.get_matrix(
-                m=m, n=n, k=int(rank),
-                missing_fraction=float(OS),
-                noise_level=float(noise_level),
-                random_state=int(seed),
-            )
-
-            env_tag = f"m{m}_n{n}_rank{int(rank)}_OS{float(OS)}_noise{noise_level}_seed{seed}"
-            env_dir = run_dir / env_tag
-            env_dir.mkdir(parents=True, exist_ok=True)
-            click.echo(f"Environment dir: {env_dir}")
-
-            click.echo(f"Running {len(algos)} algorithms...")
-            for spec in algos:
-                meta = {
-                    "algo": spec.algo_id,
-                    "rank": int(rank),
-                    "OS": float(OS),
-                    "noise_level": float(noise_level),
-                    "seed": int(seed),
-                    "m": int(m),
-                    "n": int(n),
-                }
-
-                X_hat, df, summary = run_one_algorithm(spec, mat, rank=int(rank), meta=meta)
-                all_summaries.append(summary)
-                all_iters.append(df)
-
-                if viz:
-                    click.echo(f"Saving matrix visualizations for {spec.algo_id}...")
-                    save_matrix_viz(mat, X_hat, env_dir / "viz", prefix=spec.algo_id)
-
-            click.echo("Plotting curves for this environment...")
-            df_env = pd.concat([d for d in all_iters if (d["rank"].iloc[0] == int(rank) and d["OS"].iloc[0] == float(OS))],
-                               ignore_index=True)
-            plot_curves(df_env, env_dir / "plots", env_tag=env_tag)
-            click.echo(f"Saved plots to: {env_dir / 'plots'}")
-
-    click.echo("\nSaving aggregated CSVs...")
-    df_iters = pd.concat(all_iters, ignore_index=True)
-    df_summary = pd.DataFrame(all_summaries)
-
-    df_iters.to_csv(run_dir / "iters.csv", index=False)
-    df_summary.to_csv(run_dir / "summary.csv", index=False)
-
-    click.echo("Saving run config...")
-    (run_dir / "config.json").write_text(json.dumps({
-        "m": m, "n": n, "ranks": list(ranks), "OSs": list(OSs),
-        "noise_level": noise_level, "seed": seed,
-        "alpha": alpha, "num_iters": num_iters, "tol": tol,
-        "viz": viz,
-    }, indent=2))
-
-    click.secho(f"Done. Saved results to: {run_dir}", fg="green")
-
-
-@mc.command()
-@click.option("--m", type=int, default=900, show_default=True)
-@click.option("--n", type=int, default=900, show_default=True)
-@click.option("--rank", type=int, default=10, show_default=True)
-@click.option("--os", "OS", type=float, default=0.9, show_default=True)
-@click.option("--noise-level", type=float, default=0.0, show_default=True)
-
-@click.option("--trials", type=int, default=10, show_default=True)
-@click.option("--seed0", type=int, default=42, show_default=True)
-
-@click.option("--alpha", type=float, default=0.33, show_default=True)
-@click.option("--num-iters", type=int, default=30_000, show_default=True)
-@click.option("--tol", type=float, default=1e-6, show_default=True)
-
-@click.option("--out", "out_dir", type=click.Path(path_type=Path), default=Path("out"), show_default=True)
-@click.option("--save-curves/--no-save-curves", default=False, show_default=True)
-def sweep(m, n, rank, OS, noise_level, trials, seed0, alpha, num_iters, tol, out_dir, save_curves):
-    click.secho("Starting sweep evaluation...", fg="green")
-    click.echo(f"Env: m={m}, n={n}, rank={rank}, OS={OS}, noise_level={noise_level}")
-    click.echo(f"Trials: {trials} (seed0={seed0})")
-    click.echo(f"Save curves: {save_curves}")
-    click.echo(f"Output root: {out_dir}")
-
-    MG = MatrixGenerator()
-    algos = build_algos(num_iters=num_iters, tol=tol, alpha=alpha)
-
-    run_dir = out_dir / time.strftime("sweep_%Y%m%d_%H%M%S")
-    run_dir.mkdir(parents=True, exist_ok=True)
-    click.echo(f"Sweep directory: {run_dir}")
-
-    summaries = []
-    curves = []
-
-    for t in range(trials):
-        seed = seed0 + t
-        click.secho(f"\nTrial {t+1}/{trials}: generating matrix (seed={seed})...", fg="cyan")
-
-        mat = MG.get_matrix(
-            m=m, n=n, k=rank,
-            missing_fraction=OS,
-            noise_level=noise_level,
-            random_state=seed,
-        )
-
-        click.echo(f"Running {len(algos)} algorithms...")
-        for spec in algos:
-            meta = {
-                "algo": spec.algo_id,
-                "trial": int(t),
-                "seed": int(seed),
-                "m": int(m),
-                "n": int(n),
-                "rank": int(rank),
-                "OS": float(OS),
-                "noise_level": float(noise_level),
-            }
-            _, df, summary = run_one_algorithm(spec, mat, rank=rank, meta=meta)
-            summaries.append(summary)
-
-            if save_curves:
-                curves.append(df)
-
-    click.echo("\nSaving sweep CSVs...")
-    df_sum = pd.DataFrame(summaries)
-    df_sum.to_csv(run_dir / "summary_raw.csv", index=False)
-
-    click.echo("Aggregating statistics...")
-    agg = (
-        df_sum.groupby("algo")
-        .agg(
-            trials=("trial", "count"),
-            mean_time_s=("time_s", "mean"),
-            std_time_s=("time_s", "std"),
-            mean_final_rel_error=("final_rel_error", "mean"),
-            std_final_rel_error=("final_rel_error", "std"),
-            mean_final_rel_residual=("final_rel_residual", "mean"),
-            std_final_rel_residual=("final_rel_residual", "std"),
-        )
-        .reset_index()
-    )
-    agg.to_csv(run_dir / "summary_stats.csv", index=False)
-
-    if save_curves and curves:
-        click.echo("Saving per-iteration curves for all trials...")
-        pd.concat(curves, ignore_index=True).to_csv(run_dir / "iters_all_trials.csv", index=False)
-
-    click.secho(f"Done. Saved sweep results to: {run_dir}", fg="green")
-
-
-@mc.command()
-@click.argument("iters_csv", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-@click.option("--out", "out_dir", type=click.Path(path_type=Path), default=Path("out_plots"), show_default=True)
-def plot(iters_csv: Path, out_dir: Path):
-    click.secho("Plotting from CSV...", fg="green")
-    click.echo(f"Input: {iters_csv}")
-    click.echo(f"Output: {out_dir}")
-
-    df = pd.read_csv(iters_csv)
+@click.option("--print-matrices/--no-print-matrices", default=False, show_default=True)
+@click.option("--print-limit", type=int, default=20, show_default=True, help="If matrix bigger than this, print top-left block.")
+def run(m, n, rank, OS, noise_level, seed, alpha, num_iters, tol, out_dir, print_matrices, print_limit):
+    """
+    Run all methods once for a single environment and save ONE multi-panel PNG with curves per method.
+    """
+    click.secho("Starting evaluation (single environment)...", fg="green")  # Click styling helpers. [web:81]
+    click.echo(f"m={m}, n={n}, rank={rank}, OS={OS}, noise_level={noise_level}, seed={seed}")
+    click.echo(f"num_iters={num_iters}, tol={tol}, alpha={alpha}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    keys = ["rank", "OS", "seed", "noise_level"]
-    click.echo(f"Found {df.groupby(keys).ngroups} environments in CSV.")
-    for env_vals, df_env in df.groupby(keys):
-        env_tag = "_".join(f"{k}{v}" for k, v in zip(keys, env_vals))
-        click.echo(f"Plotting env: {env_tag}")
-        plot_curves(df_env, out_dir, env_tag=env_tag)
+    MG = MatrixGenerator()
+    algos = build_algos(tol=tol, alpha=alpha)
 
-    click.secho("Done plotting.", fg="green")
+    click.echo("Generating matrix...")
+    mat = MG.get_matrix(
+        m=m, n=n, k=int(rank),
+        missing_fraction=float(OS),
+        noise_level=float(noise_level),
+        random_state=int(seed),
+    )
 
+    click.echo(f"Running {len(algos)} algorithms...")
+    dfs: List[pd.DataFrame] = []
 
-def main():
-    mc()
+    # Optional: keep one completed matrix to print (e.g., last algo)
+    last_X = None
 
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    env_tag = f"m{m}_n{n}_k{rank}_OS{OS}_noise{noise_level}_seed{seed}_{stamp}"
+
+    for spec in algos:
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+        X_hat, df = run_one_algorithm(spec, mat, rank=rank)
+
+        # save per-algo PNG containing all metrics as subplots
+        algo_png = out_dir / f"{spec.algo_id}__metrics__{env_tag}.png"
+        legend = algo_legend_label(spec.algo_id, rank=rank, alpha=alpha)  # your mathtext label
+        title = f"{spec.algo_id}: m={m}, n={n}, k={rank}, OS={OS}, noise={noise_level}, seed={seed}"
+        plot_metrics_single_algo(df, algo_png, title=title, legend_label=legend)
+        click.echo(f"Saved: {algo_png}")
+
+        if print_matrices:
+            save_matrix_viz(mat, X_hat, out_dir / f"{spec.algo_id}__matrices__{env_tag}", prefix=spec.algo_id)
+            click.echo(f"Saved matrices to: {out_dir / f'{spec.algo_id}__matrices__{env_tag}'}")
 
 if __name__ == "__main__":
-    main()
+    run()
