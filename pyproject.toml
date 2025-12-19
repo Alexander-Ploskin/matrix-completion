@@ -3,13 +3,32 @@ name = "matrix-completion"
 version = "0.1.0"
 description = ""
 authors = [
-    {name = "aploskin",email = "aploskin@ozon.ru"}
+    { name = "aploskin", email = "aploskin@ozon.ru" }
 ]
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
-dependencies = [
-]
+dependencies = []
 
+[tool.poetry]
+name = "matrix-completion"
+version = "0.1.0"
+description = ""
+authors = ["aploskin <aploskin@ozon.ru>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.13"
+numpy = "^2.2.0"
+pandas = "^2.3.3"
+seaborn = "^0.13.2"
+scikit-learn = "^1.8.0"
+matplotlib = "^3.10.8"
+tqdm = "^4.67.1"
+cupy-cuda12x = "^13.6.0"
+click = "^8.3.1"
+
+[tool.poetry.group.dev.dependencies]
+# optional; keep empty or add dev deps later
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
